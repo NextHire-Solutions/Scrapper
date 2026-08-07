@@ -20,23 +20,13 @@
 //   ...--accounts=1,7,8       a subset       (default: all configured)
 
 import { login } from './src/auth.js';
-import { buildSearchQuery, fetchSearchPage } from './src/api.js';
-import { DEFAULT_STATUSES, sleep } from './src/constants.js';
+import { sleep } from './src/constants.js';
+import { collectRoleTitleMap } from './src/roles.js';
 
 const args = process.argv.slice(2);
 const WRITE = args.includes('--write');
 const accArg = (args.find((a) => a.startsWith('--accounts=')) || '').split('=')[1] || 'all';
 const DELAY = Number(process.env.COURTED_DELAY_MS) || 500;  // polite pause between pages
-const PAGE = Number(process.env.BACKFILL_PAGE) || 500;      // API honors up to 500/page
-// Lean query: we only need courted_mls_id, so strip the heavy contact/annotate
-// work. Fewer + lighter requests = smaller footprint (less likely to get flagged).
-const LEAN = {
-    include_broker_company_prospect_data: 'false',
-    annotate_mutual_connection_info: 'false',
-    annotate_watchlists_in: 'false',
-    annotate_last_re_activity_date: 'false',
-};
-const jitter = () => DELAY + Math.floor(Math.random() * 300);
 const DB_CHUNK = 150;
 
 const SB_URL = (process.env.SUPABASE_URL || '').replace(/\/+$/, '');
@@ -52,33 +42,6 @@ function readAccounts() {
     if (accArg === 'all') return out;
     const want = new Set(accArg.split(',').map((s) => Number(s.trim())));
     return out.filter((a) => want.has(a.n));
-}
-
-// Page one filtered list (at_type_includes=<value>), STRICTLY SERIAL with a
-// polite jittered delay between pages — slow on purpose so we never look like a
-// burst/scraper and never get the account rate-limited or flagged.
-async function collectIds(session, value, label) {
-    const ids = new Set();
-    let offset = 0;
-    let total = null;
-    for (;;) {
-        const q = buildSearchQuery({
-            limit: PAGE, offset, statuses: DEFAULT_STATUSES, includeContactInfo: false,
-            extraParams: { ...LEAN, at_type_includes: value },
-        });
-        let d;
-        try { d = await fetchSearchPage(session, q); }
-        catch (e) { console.error(`\n  ! ${label} page@${offset}: ${e.message} (retrying once after pause)`); await sleep(4000); try { d = await fetchSearchPage(session, q); } catch (e2) { console.error(`  !! giving up on page@${offset}: ${e2.message}`); break; } }
-        if (total === null) total = Number.isFinite(d.count) ? d.count : 0;
-        const rows = d.results || [];
-        rows.forEach((r) => r.courted_mls_id && ids.add(r.courted_mls_id));
-        process.stderr.write(`\r  ${label}: ${ids.size}/${total}   `);
-        offset += PAGE;
-        if (rows.length < PAGE || offset >= total) break;
-        await sleep(jitter());
-    }
-    process.stderr.write('\n');
-    return ids;
 }
 
 // Count DB rows currently matching these agent_ids.
@@ -130,7 +93,10 @@ async function sample(ids, newTitle, k = 6) {
     if (!SB_URL || !SB_KEY) { console.error('Missing SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY'); process.exit(1); }
     const accounts = readAccounts();
     if (!accounts.length) { console.error('No Courted accounts matched.'); process.exit(1); }
-    console.error(`MODE: ${WRITE ? 'LIVE WRITE' : 'DRY RUN (no writes)'} · accounts: ${accounts.map((a) => a.n).join(',')} · page ${PAGE}, serial\n`);
+    console.error(`MODE: ${WRITE ? 'LIVE WRITE' : 'DRY RUN (no writes)'} · accounts: ${accounts.map((a) => a.n).join(',')} · per-MLS, serial\n`);
+
+    // Progress adapter for roles.js's per-page logging.
+    const log = { debug: (m) => process.stderr.write(`\r${m}   `), warning: (m) => console.error(`\n  ! ${m}`) };
 
     const tlAll = new Set(), mbAll = new Set();
     for (const acc of accounts) {
@@ -138,9 +104,18 @@ async function sample(ids, newTitle, k = 6) {
         let session;
         try { session = await login(acc.email, acc.password); }
         catch (e) { console.error(`  ! login failed: ${e.message}`); continue; }
-        (await collectIds(session, 'at_team_leader', 'team leaders')).forEach((x) => tlAll.add(x));
-        await sleep(1500);
-        (await collectIds(session, 'at_manager_managing_broker', 'managing brokers')).forEach((x) => mbAll.add(x));
+        // collectRoleTitleMap enumerates the account's MLS codes and pages each
+        // scoped by mls_id to the true end — so no MLS gets skipped (the old
+        // account-wide pager quit early and missed whole MLSs like HAR).
+        let map;
+        try { map = await collectRoleTitleMap(session, { delayMs: DELAY, log }); }
+        catch (e) { console.error(`\n  ! role collection failed: ${e.message}`); continue; }
+        for (const [id, title] of map) {
+            if (title.includes('Team Leader')) tlAll.add(id);
+            if (title.includes('Managing Broker')) mbAll.add(id);
+        }
+        process.stderr.write('\n');
+        console.error(`  collected: ids=${map.size} (TL+MB, deduped this account)`);
         await sleep(2500);  // breathe between accounts
     }
 
