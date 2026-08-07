@@ -44,11 +44,23 @@ function readAccounts() {
     return out.filter((a) => want.has(a.n));
 }
 
+// fetch with retries — a transient network reset (ECONNRESET) mid-run must NOT
+// kill a long write. Retries a few times with backoff on a thrown fetch error.
+async function fetchRetry(url, opts, tries = 4) {
+    for (let i = 0; i < tries; i += 1) {
+        try { return await fetch(url, opts); }
+        catch (e) {
+            if (i === tries - 1) throw e;
+            await sleep(2000 * (i + 1));
+        }
+    }
+}
+
 // Count DB rows currently matching these agent_ids.
 async function dbCount(ids) {
     let n = 0;
     for (const grp of chunk(ids, DB_CHUNK)) {
-        const res = await fetch(`${SB_URL}/rest/v1/agents?source_ids->courted->>agent_id=in.(${grp.map(enc).join(',')})&select=id`, {
+        const res = await fetchRetry(`${SB_URL}/rest/v1/agents?source_ids->courted->>agent_id=in.(${grp.map(enc).join(',')})&select=id`, {
             headers: { apikey: SB_KEY, Authorization: `Bearer ${SB_KEY}`, Prefer: 'count=exact', Range: '0-0' },
         });
         n += Number((res.headers.get('content-range') || '*/0').split('/')[1] || 0);
@@ -60,7 +72,7 @@ async function dbCount(ids) {
 async function dbSetTitle(ids, title) {
     let affected = 0;
     for (const grp of chunk(ids, DB_CHUNK)) {
-        const res = await fetch(`${SB_URL}/rest/v1/agents?source_ids->courted->>agent_id=in.(${grp.map(enc).join(',')})`, {
+        const res = await fetchRetry(`${SB_URL}/rest/v1/agents?source_ids->courted->>agent_id=in.(${grp.map(enc).join(',')})`, {
             method: 'PATCH',
             headers: {
                 apikey: SB_KEY, Authorization: `Bearer ${SB_KEY}`,
