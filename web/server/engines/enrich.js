@@ -122,37 +122,71 @@ async function run(job, items) {
     }
 }
 
+// A CAPTCHA page, a blocked stub ("page too small"), or a transient fetch error
+// are all one-off unblocker misses — a fresh attempt usually returns the real
+// page. So fetch+parse retries up to ATTEMPTS before recording a failure, and
+// the whole item runs under a hard watchdog so no single URL can hang the run.
+const ATTEMPTS = 3;
+const ITEM_TIMEOUT_MS = 6 * 60 * 1000;
+
 async function processOne(job, item, browser) {
+    let timer;
+    const watchdog = new Promise((resolve) => {
+        timer = setTimeout(() => resolve({ timedOut: true }), ITEM_TIMEOUT_MS);
+    });
+    const r = await Promise.race([processOneInner(job, item, browser), watchdog])
+        .catch((err) => ({ error: err.message }));
+    clearTimeout(timer);
+    if (r && r.timedOut) {
+        item._timedOut = true;   // the abandoned attempt must not also record a row
+        job.counts.error += 1;
+        job.rows.push({ url: item.url, source: item.source, status: 'error', message: `timed out after ${ITEM_TIMEOUT_MS / 60000}m` });
+    } else if (r && r.error) {
+        job.counts.error += 1;
+        job.rows.push({ url: item.url, source: item.source, status: 'error', message: r.error });
+    }
+}
+
+async function processOneInner(job, item, browser) {
     const { url, source } = item;
-    let html;
-    try {
-        // Zillow profiles are JS-rendered; realtor server-renders __NEXT_DATA__.
-        html = await fetchUnblocked(url, { render: source === 'zillow' });
-    } catch (err) {
-        job.counts.error += 1;
-        job.rows.push({ url, source, status: 'error', message: err.message });
-        return;
+    let html = null;
+    let parsed = null;
+    let lastFail = '';
+    for (let attempt = 1; attempt <= ATTEMPTS; attempt += 1) {
+        if (job.aborted) return {};
+        if (attempt > 1) await new Promise((res) => setTimeout(res, 3000 * (attempt - 1)));
+        try {
+            // Zillow profiles are JS-rendered; realtor server-renders __NEXT_DATA__.
+            html = await fetchUnblocked(url, { render: source === 'zillow' });
+        } catch (err) {
+            lastFail = err.message;
+            continue;
+        }
+        if (!html || html.length < 1500) {
+            lastFail = `page too small (${html ? html.length : 0} bytes)`;
+            continue;
+        }
+        try {
+            parsed = await parseProfile({ url, html, browser });
+            break;
+        } catch (err) {
+            // e.g. Zillow CAPTCHA — a transient unblocker miss, not a dead URL.
+            parsed = null;
+            lastFail = err.message;
+        }
     }
-    if (!html || html.length < 1500) {
-        job.counts.blocked += 1;
-        job.rows.push({ url, source, status: 'blocked' });
-        return;
+    if (item._timedOut) return {};    // watchdog already recorded this URL
+    if (!parsed) {
+        const blocked = /page too small|CAPTCHA/i.test(lastFail);
+        job.counts[blocked ? 'blocked' : 'error'] += 1;
+        job.rows.push({ url, source, status: blocked ? 'blocked' : 'error', message: `${lastFail} — after ${ATTEMPTS} attempts` });
+        return {};
     }
 
-    let parsed;
-    try {
-        parsed = await parseProfile({ url, html, browser });
-    } catch (err) {
-        // e.g. Zillow CAPTCHA — treat as a transient fetch miss, not a dead URL.
-        job.counts.error += 1;
-        job.rows.push({ url, source, status: 'error', message: err.message });
-        return;
-    }
-
-    if (!parsed || !parsed.alive) {
+    if (!parsed.alive) {
         job.counts.dead += 1;
         job.rows.push({ url, source, status: 'dead' });
-        return;
+        return {};
     }
     job.counts.alive += 1;
 
@@ -161,6 +195,7 @@ async function processOne(job, item, browser) {
     // agent. Otherwise queue this NEW agent for the ingest webhook.
     let present = false;
     try { present = await isAlreadyPresent(parsed.row); } catch { /* treat as new */ }
+    if (item._timedOut) return {};    // watchdog fired during the DB check
     if (present) {
         job.counts.skipped += 1;
         job.rows.push({ url, source: parsed.source, status: 'skipped', row: parsed.row });

@@ -55,6 +55,8 @@ async function fetchBrightData(url, { timeoutMs = 120000, retries = 2 } = {}) {
     let lastErr;
     for (let i = 0; i <= retries; i += 1) {
         const ctrl = new AbortController();
+        // Timer stays armed until the BODY is fully read — a response whose body
+        // stalls mid-stream would otherwise hang res.text() forever (stuck run).
         const timer = setTimeout(() => ctrl.abort(), timeoutMs);
         try {
             const res = await fetch(BD_ENDPOINT, {
@@ -63,8 +65,8 @@ async function fetchBrightData(url, { timeoutMs = 120000, retries = 2 } = {}) {
                 headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
                 body: JSON.stringify({ zone, url, format: 'raw' }),
             });
-            clearTimeout(timer);
             const body = await res.text();
+            clearTimeout(timer);
             if (res.ok) return body;
             if (res.status >= 400 && res.status < 500 && res.status !== 429) {
                 throw new Error(`BrightData ${res.status}: ${body.slice(0, 140)}`);
@@ -94,8 +96,8 @@ async function fetchZenRows(url, { render = false, country = 'us', timeoutMs = 1
         const timer = setTimeout(() => ctrl.abort(), timeoutMs);
         try {
             const res = await fetch(endpoint, { signal: ctrl.signal });
+            const body = await res.text();     // timer stays armed through the body read
             clearTimeout(timer);
-            const body = await res.text();
             if (res.ok) return body;
             if (res.status >= 400 && res.status < 500 && res.status !== 429) {
                 throw new Error(`ZenRows ${res.status}: ${body.slice(0, 140)}`);
