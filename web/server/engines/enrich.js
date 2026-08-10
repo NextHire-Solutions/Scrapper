@@ -100,6 +100,17 @@ async function run(job, items) {
             row: { Name: it.name, Email: it.email, Phone: it.phone },
         });
     }
+    // A skipped match still carries a profile URL the existing row may lack —
+    // stamp it into the row's EMPTY source_url (fill-only, additive) so the
+    // agent also surfaces under the app's Zillow/Realtor source tab. Detached
+    // + best-effort: tagging never delays or fails the scrape.
+    if (ingestEnabled() && rec.skipped.length) {
+        const urlCol = (s) => (s === 'realtor' ? 'Realtor Profile URL' : 'Zillow Profile URL');
+        const pseudo = rec.skipped.map((it) => ({
+            [urlCol(it.source)]: it.url, Email: it.email, Phone: it.phone,
+        }));
+        tagSourceUrls(pseudo).then((n) => { job.tagged += n; }).catch(() => {});
+    }
 
     if (!queue.length) { job.status = 'done'; return; }
 
@@ -199,7 +210,10 @@ async function processOneInner(job, item, browser) {
     if (present) {
         job.counts.skipped += 1;
         job.rows.push({ url, source: parsed.source, status: 'skipped', row: parsed.row });
-        return;
+        // Same fill-only source_url stamp for a stage-2 skip (matched via the
+        // scraped email/phone): the scraped row is already in native shape.
+        if (ingestEnabled()) tagSourceUrls([parsed.row]).then((n) => { job.tagged += n; }).catch(() => {});
+        return {};
     }
 
     job.counts.new += 1;
