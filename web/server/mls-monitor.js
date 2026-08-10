@@ -2,19 +2,22 @@
 // EVERY configured Courted account, enumerate its MLS(s), and compare against the
 // last-seen list stored server-side (Supabase table `mls_monitor_state`). Post a
 // Slack alert when an account GAINS or LOSES an MLS — or when it fails to log in
-// (a stale password would otherwise look like "everything removed"). Read-only
-// against Courted; the only writes are the scraper's OWN baseline rows + the
-// Slack message. Fully env-gated and never throws into the caller.
+// (a stale password would otherwise look like "everything removed"). A GAINED
+// MLS is then auto-swept immediately (scoped to that MLS + account) so its
+// agents land without waiting for the 15-day refresh turn. Fully env-gated and
+// never throws into the caller.
 //
 // Env:
 //   MLS_MONITOR_ENABLED=1            turn the scheduler on (default off)
+//   MLS_MONITOR_AUTOSWEEP=0          disable the auto-sweep of newly-added MLSs (default on)
 //   MLS_MONITOR_INTERVAL_HOURS=24    scan cadence (default 24)
 //   SLACK_BOT_TOKEN / SLACK_CHANNEL_ID   where alerts go (until set, alerts log)
 //   SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY   baseline store (from db.js)
 
 import { login } from '../../courted/src/auth.js';
 import { detectAccountMls } from '../../courted/src/mls.js';
-import { readCourtedAccounts } from './engines/courted.js';
+import { readCourtedAccounts, runCourted } from './engines/courted.js';
+import { createJob } from './jobs.js';
 
 const STATE_TABLE = 'mls_monitor_state';
 
@@ -119,7 +122,45 @@ export async function runScan({ reason = 'scheduled' } = {}) {
         try { alerted = (await notifySlack(formatAlert(changes, failures, reason))).delivered; }
         catch (e) { console.error('[mls-monitor] slack:', e.message); }
     }
-    return { ok: true, scanned: accounts.length, changes: changes.length, failures: failures.length, alerted, results };
+
+    // Auto-sweep newly-ADDED MLSs right away (scoped to just that MLS on just
+    // that account) so their agents land in the DB immediately instead of
+    // waiting for the account's 15-day refresh turn. Detached + serial so the
+    // scan/endpoint returns fast and sweeps never overlap each other. Set
+    // MLS_MONITOR_AUTOSWEEP=0 to disable. Removed MLSs need no action (data is
+    // additive; nothing is deleted).
+    const toSweep = changes.filter((c) => c.added.length);
+    if (toSweep.length && autosweepEnabled()) {
+        (async () => {
+            for (const c of toSweep) {
+                const acc = accounts.find((a) => a.email.toLowerCase() === c.email.toLowerCase());
+                if (!acc) continue;
+                try {
+                    const job = createJob({
+                        sources: ['courted'],
+                        courtedAllAgents: true,      // full sweep of the selected MLS(s)
+                        courtedBanded: true,
+                        courtedOnly: [acc.email],
+                        courtedMlsIds: [...c.added],
+                    });
+                    job.pending = 1;
+                    await runCourted(job);
+                    const s = job.sources.courted || {};
+                    const line = s.status === 'error'
+                        ? `*Courted MLS monitor* — ⚠️ auto-sweep of new MLS ${c.added.join(', ')} (*${c.email}*) failed: ${s.message || 'unknown error'}`
+                        : `*Courted MLS monitor* — ✅ auto-sweep of new MLS ${c.added.join(', ')} (*${c.email}*) done: ${(s.count || 0).toLocaleString()} agents captured.`;
+                    await notifySlack(line).catch(() => {});
+                } catch (e) {
+                    await notifySlack(`*Courted MLS monitor* — ⚠️ auto-sweep of new MLS ${c.added.join(', ')} (*${c.email}*) failed: ${e.message}`).catch(() => {});
+                }
+            }
+        })();
+    }
+    return { ok: true, scanned: accounts.length, changes: changes.length, failures: failures.length, alerted, autosweeping: autosweepEnabled() ? toSweep.length : 0, results };
+}
+
+function autosweepEnabled() {
+    return !/^(0|false|no|off)$/i.test(String(process.env.MLS_MONITOR_AUTOSWEEP ?? '1'));
 }
 
 // --- Slack -------------------------------------------------------------------
