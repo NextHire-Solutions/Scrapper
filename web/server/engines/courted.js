@@ -111,6 +111,12 @@ export async function runCourted(job) {
     // "Salesperson". Needs the Supabase creds (dbEnabled); set
     // courtedStampTitles:false to skip. See courted/src/roles.js.
     const stampTitles = dbEnabled() && job.params.courtedStampTitles !== false;
+    // Role titles are collected BEFORE each sweep (per-MLS scoped) so every row
+    // can carry its role natively — Title plus the "Is Team Leader" /
+    // "Is Managing Broker" checkboxes the DB app reads. The post-sweep DB stamp
+    // then reuses this same map (no second collection).
+    const roleTitles = new Map();   // courted_mls_id -> 'Team Leader' | 'Managing Broker' | both
+    let rolesReady = false;         // only stamp rows once a collection has succeeded
     let buffer = [];
     let sent = 0;
     const flush = async () => {
@@ -139,6 +145,14 @@ export async function runCourted(job) {
         if (reachedCap()) return;
         const cid = String(row['Courted Agent ID'] || '').trim();
         if (cid) allCourtedIds.add(cid); // record before dedupe so cross-account ids are all captured
+        if (rolesReady && cid) {
+            // Stamp the role onto the row itself so the ingest payload carries it
+            // (per MLS): the app populates its checkbox fields from these columns.
+            const rt = roleTitles.get(cid) || '';
+            row.Title = rt || 'Salesperson';
+            row['Is Team Leader'] = rt.includes('Team Leader') ? 'Yes' : 'No';
+            row['Is Managing Broker'] = rt.includes('Managing Broker') ? 'Yes' : 'No';
+        }
         const key = personKey(row);
         if (key && seen.has(key)) return; // already seen on another account/MLS
         if (key) seen.add(key);
@@ -176,6 +190,25 @@ export async function runCourted(job) {
             });
             emit(job, 'progress', { source, status: 'running', message: `${segments.length} segments planned — ${scopeTag || 'scraping'}…` });
         }
+
+        // Collect role titles FIRST (per-MLS scoped lists — small, page fully)
+        // so the sweep's rows carry Title + the Is Team Leader / Is Managing
+        // Broker checkboxes natively. A collection failure never blocks the
+        // sweep — rows then keep the default title and the post-sweep stamp is
+        // skipped for safety.
+        if (stampTitles) {
+            try {
+                emit(job, 'progress', { source, status: 'running', message: `Collecting role titles — ${scopeTag || 'account'}…` });
+                if (!session) session = await login(acc.email, acc.password);
+                const m = await collectRoleTitleMap(session, { delayMs: Number(process.env.COURTED_DELAY_MS) || 500, log, extraParams });
+                for (const [id, t] of m) roleTitles.set(id, t);
+                rolesReady = true;
+                log.info(`Role titles collected — ${m.size.toLocaleString()} leaders/brokers (${scopeTag || 'account'}).`);
+            } catch (e) {
+                log.warning(`Role-title collection failed (${scopeTag || acc.email}) — rows keep default title: ${e.message}`);
+            }
+        }
+
         await runScrape(
             {
                 email: acc.email,
@@ -195,17 +228,15 @@ export async function runCourted(job) {
             { log, shouldStop, onRecord, onMeta },
         );
 
-        // Post-sweep role tagging: page this account's team-leader /
-        // managing-broker filters (gentle, serial) — scoped to the MLS when
-        // filtering — and PATCH the correct `title` on the agents we just touched.
-        // Best-effort; a tagging hiccup never fails the sweep.
-        if (stampTitles) {
+        // Post-sweep DB stamp: reuse the pre-collected role map (no second
+        // collection) and PATCH `title` on the agents this sweep touched —
+        // covers rows that predate this sweep's ingest. Best-effort; a tagging
+        // hiccup never fails the sweep.
+        if (stampTitles && rolesReady) {
             try {
                 emit(job, 'progress', { source, status: 'running', message: `Tagging roles (Team Leader / Managing Broker) — ${scopeTag || 'account'}…` });
-                const roleSession = await login(acc.email, acc.password);
-                const roleMap = await collectRoleTitleMap(roleSession, { delayMs: Number(process.env.COURTED_DELAY_MS) || 500, log, extraParams });
                 const scoped = new Map();
-                for (const [id, title] of roleMap) if (allCourtedIds.has(id)) scoped.set(id, title);
+                for (const [id, title] of roleTitles) if (allCourtedIds.has(id)) scoped.set(id, title);
                 const n = await stampCourtedTitles(scoped);
                 if (n) log.info(`Tagged ${n.toLocaleString()} role titles — ${scopeTag || 'account'}.`);
             } catch (e) {

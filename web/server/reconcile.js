@@ -264,14 +264,24 @@ export async function stampCourtedTitles(titleById) {
         byTitle.get(title).push(String(id));
     }
     let stamped = 0;
+    let failed = 0;
     for (const [title, ids] of byTitle) {
         for (const grp of chunk(ids, 100)) {
-            try {
-                await sbPatch(`agents?source_ids->courted->>agent_id=in.(${grp.map(enc).join(',')})`, { title });
-                stamped += grp.length;
-            } catch { /* best-effort — a title miss never fails the sweep */ }
+            // Retry each chunk a few times — a silently dropped chunk leaves a
+            // pocket of agents untitled (how AGSMLS lost 186 of its leaders).
+            let ok = false;
+            for (let t = 0; t < 4 && !ok; t += 1) {
+                if (t) await new Promise((r) => setTimeout(r, 1500 * t));
+                try {
+                    await sbPatch(`agents?source_ids->courted->>agent_id=in.(${grp.map(enc).join(',')})`, { title });
+                    ok = true;
+                } catch { /* retry */ }
+            }
+            if (ok) stamped += grp.length;
+            else failed += grp.length;
         }
     }
+    if (failed) console.error(`[stampCourtedTitles] ${failed} ids FAILED to stamp after retries (stamped ${stamped})`);
     return stamped;
 }
 

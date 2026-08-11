@@ -69,22 +69,33 @@ async function dbCount(ids) {
 }
 
 // PATCH title on rows matching these agent_ids. Returns rows affected.
+// A chunk retries on BOTH thrown fetch errors (fetchRetry) and non-OK responses
+// — a silently skipped chunk leaves a pocket of agents untitled (that's how
+// AGSMLS lost 186 of its 305 leaders in the first repair pass).
 async function dbSetTitle(ids, title) {
     let affected = 0;
+    let failedChunks = 0;
     for (const grp of chunk(ids, DB_CHUNK)) {
-        const res = await fetchRetry(`${SB_URL}/rest/v1/agents?source_ids->courted->>agent_id=in.(${grp.map(enc).join(',')})`, {
-            method: 'PATCH',
-            headers: {
-                apikey: SB_KEY, Authorization: `Bearer ${SB_KEY}`,
-                'Content-Type': 'application/json', Prefer: 'return=representation,count=exact', Range: '0-0',
-            },
-            body: JSON.stringify({ title }),
-        });
-        if (!res.ok) { console.error(`\n  ! PATCH ${res.status}: ${(await res.text()).slice(0, 160)}`); continue; }
-        affected += Number((res.headers.get('content-range') || '*/0').split('/')[1] || 0);
+        let ok = false;
+        for (let t = 0; t < 4 && !ok; t += 1) {
+            if (t) await sleep(2000 * t);
+            const res = await fetchRetry(`${SB_URL}/rest/v1/agents?source_ids->courted->>agent_id=in.(${grp.map(enc).join(',')})`, {
+                method: 'PATCH',
+                headers: {
+                    apikey: SB_KEY, Authorization: `Bearer ${SB_KEY}`,
+                    'Content-Type': 'application/json', Prefer: 'return=representation,count=exact', Range: '0-0',
+                },
+                body: JSON.stringify({ title }),
+            });
+            if (!res.ok) { console.error(`\n  ! PATCH ${res.status} (attempt ${t + 1}/4): ${(await res.text()).slice(0, 160)}`); continue; }
+            affected += Number((res.headers.get('content-range') || '*/0').split('/')[1] || 0);
+            ok = true;
+        }
+        if (!ok) failedChunks += 1;
         process.stderr.write(`\r  writing "${title}": ${affected}   `);
     }
     process.stderr.write('\n');
+    if (failedChunks) console.error(`  !! ${failedChunks} chunk(s) (~${failedChunks * DB_CHUNK} ids) FAILED after retries — re-run to close the gap`);
     return affected;
 }
 
