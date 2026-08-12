@@ -23,13 +23,16 @@ const LEAN = {
 // Page one role filter (at_type_includes=<value>) STRICTLY SERIAL with a polite
 // jittered delay between pages — slow on purpose so an account never looks like
 // a burst/scraper and never gets rate-limited.
-async function collectIds(session, value, { delayMs = 500, log, extraParams = {} } = {}) {
+async function collectIds(session, value, { delayMs = 500, log, extraParams = {}, meta = null } = {}) {
     const ids = new Set();
     let offset = 0;
     let total = null;
     for (;;) {
         const q = buildSearchQuery({
-            limit: PAGE, offset, statuses: DEFAULT_STATUSES, includeContactInfo: false,
+            // Contact info is requested ONLY when a meta sink is supplied: the
+            // email is the last-resort match key for leaders whose DB row was
+            // merged under another MLS/source key (see stampCourtedTitles).
+            limit: PAGE, offset, statuses: DEFAULT_STATUSES, includeContactInfo: Boolean(meta),
             // extraParams (e.g. { mls_id }) scopes the role paging to one MLS so a
             // single-MLS sweep doesn't page the whole account's leaders/brokers.
             extraParams: { ...LEAN, ...extraParams, at_type_includes: value },
@@ -54,7 +57,14 @@ async function collectIds(session, value, { delayMs = 500, log, extraParams = {}
         }
         if (total === null) total = Number.isFinite(d.count) ? d.count : 0;
         const rows = d.results || [];
-        rows.forEach((r) => r.courted_mls_id && ids.add(r.courted_mls_id));
+        rows.forEach((r) => {
+            if (!r.courted_mls_id) return;
+            ids.add(r.courted_mls_id);
+            // Fallback match keys: the person-level courted_id and the email.
+            // A leader's DB row is often merged under ANOTHER MLS's key, so the
+            // per-MLS agent_id alone can't find them (see stampCourtedTitles).
+            if (meta) meta.set(r.courted_mls_id, { id: r.courted_id == null ? '' : String(r.courted_id), email: String(r.email || '').toLowerCase() });
+        });
         offset += PAGE;
         if (log) log.debug?.(`  role "${value}": ${ids.size}/${total}`);
         // Stop ONLY at the true end of the list. The old check also bailed on the
@@ -85,19 +95,26 @@ export async function collectRoleTitleMap(session, opts = {}) {
     // so no MLS gets skipped.
     const { mls } = await detectAccountMls(session, { thorough: true });
     const map = new Map();
+    map.meta = new Map();
     for (const m of mls) {
         const sub = await collectScoped(session, { ...opts, extraParams: { ...extraParams, mls_id: m.code } });
         for (const [id, title] of sub) map.set(id, title);
+        if (sub.meta) for (const [id, info] of sub.meta) map.meta.set(id, info);
         await sleep(1500);
     }
     return map;
 }
 
 // Tag the leaders/brokers visible under the given opts (scoped by opts.extraParams).
+// The returned Map carries a `.meta` Map(courted_mls_id → {id, email}) of
+// fallback match keys — extra property, so plain `for (const [id,title] of map)`
+// callers are unaffected.
 async function collectScoped(session, opts = {}) {
-    const tl = await collectIds(session, 'at_team_leader', opts);
+    const meta = new Map();
+    const o = { ...opts, meta };
+    const tl = await collectIds(session, 'at_team_leader', o);
     await sleep(1500);
-    const mb = await collectIds(session, 'at_manager_managing_broker', opts);
+    const mb = await collectIds(session, 'at_manager_managing_broker', o);
     const map = new Map();
     for (const id of new Set([...tl, ...mb])) {
         const parts = [];
@@ -105,5 +122,6 @@ async function collectScoped(session, opts = {}) {
         if (tl.has(id)) parts.push('Team Leader');
         map.set(id, parts.join(', '));
     }
+    map.meta = meta;
     return map;
 }

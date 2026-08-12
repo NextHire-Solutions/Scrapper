@@ -254,14 +254,25 @@ export async function isAlreadyPresent(row) {
  * @param {Map<string,string>|Iterable<[string,string]>} titleById
  * @returns {Promise<number>}
  */
-export async function stampCourtedTitles(titleById) {
+export async function stampCourtedTitles(titleById, meta = null) {
     if (!dbEnabled() || !titleById) return 0;
     // Group ids by title so each PATCH sets a single value.
     const byTitle = new Map();
+    const personByTitle = new Map();   // title -> [person-level courted_id]
+    const emailByTitle = new Map();    // title -> [email]
     for (const [id, title] of titleById) {
         if (!id || !title) continue;
         if (!byTitle.has(title)) byTitle.set(title, []);
         byTitle.get(title).push(String(id));
+        const info = meta && meta.get ? meta.get(id) : null;
+        if (info && info.id) {
+            if (!personByTitle.has(title)) personByTitle.set(title, []);
+            personByTitle.get(title).push(String(info.id));
+        }
+        if (info && info.email) {
+            if (!emailByTitle.has(title)) emailByTitle.set(title, []);
+            emailByTitle.get(title).push(info.email);
+        }
     }
     let stamped = 0;
     let failed = 0;
@@ -282,7 +293,34 @@ export async function stampCourtedTitles(titleById) {
         }
     }
     if (failed) console.error(`[stampCourtedTitles] ${failed} ids FAILED to stamp after retries (stamped ${stamped})`);
+
+    // Fallback passes — a leader's row is often merged under ANOTHER MLS's (or
+    // source's) key, so the per-MLS agent_id above can't reach it. Match by the
+    // person-level courted_id, then by email. Both are UPGRADE-ONLY (they touch
+    // only rows still Salesperson/null), so they can never downgrade a title
+    // someone earned in a different MLS.
+    stamped += await upgradeOnly(personByTitle, (grp) => `source_ids->courted->>id=in.(${grp.map(enc).join(',')})`);
+    stamped += await upgradeOnly(emailByTitle, (grp) => `or=(preferred_email.in.(${grp.map(enc).join(',')}),enriched_email.in.(${grp.map(enc).join(',')}))`);
     return stamped;
+}
+
+// PATCH `title` on rows matching the built filter, but ONLY where the row has no
+// real title yet. Chunked + retried; best-effort like the primary pass.
+async function upgradeOnly(byTitle, buildFilter) {
+    let n = 0;
+    for (const [title, keys] of byTitle) {
+        for (const grp of chunk([...new Set(keys)], 80)) {
+            for (let t = 0; t < 3; t += 1) {
+                if (t) await new Promise((r) => setTimeout(r, 1500 * t));
+                try {
+                    await sbPatch(`agents?${buildFilter(grp)}&or=(title.eq.Salesperson,title.is.null)`, { title });
+                    n += grp.length;
+                    break;
+                } catch { /* retry, then give up on this chunk */ }
+            }
+        }
+    }
+    return n;
 }
 
 export async function tagSourceUrls(rows) {

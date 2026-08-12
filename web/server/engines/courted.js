@@ -116,6 +116,7 @@ export async function runCourted(job) {
     // "Is Managing Broker" checkboxes the DB app reads. The post-sweep DB stamp
     // then reuses this same map (no second collection).
     const roleTitles = new Map();   // courted_mls_id -> 'Team Leader' | 'Managing Broker' | both
+    const roleMeta = new Map();     // courted_mls_id -> { id, email } fallback match keys
     let rolesReady = false;         // only stamp rows once a collection has succeeded
     let buffer = [];
     let sent = 0;
@@ -202,6 +203,7 @@ export async function runCourted(job) {
                 if (!session) session = await login(acc.email, acc.password);
                 const m = await collectRoleTitleMap(session, { delayMs: Number(process.env.COURTED_DELAY_MS) || 500, log, extraParams });
                 for (const [id, t] of m) roleTitles.set(id, t);
+                if (m.meta) for (const [id, info] of m.meta) roleMeta.set(id, info);
                 rolesReady = true;
                 log.info(`Role titles collected — ${m.size.toLocaleString()} leaders/brokers (${scopeTag || 'account'}).`);
             } catch (e) {
@@ -237,7 +239,7 @@ export async function runCourted(job) {
                 emit(job, 'progress', { source, status: 'running', message: `Tagging roles (Team Leader / Managing Broker) — ${scopeTag || 'account'}…` });
                 const scoped = new Map();
                 for (const [id, title] of roleTitles) if (allCourtedIds.has(id)) scoped.set(id, title);
-                const n = await stampCourtedTitles(scoped);
+                const n = await stampCourtedTitles(scoped, roleMeta);
                 if (n) log.info(`Tagged ${n.toLocaleString()} role titles — ${scopeTag || 'account'}.`);
             } catch (e) {
                 log.warning(`Role-title tagging skipped (${scopeTag || acc.email}): ${e.message}`);
