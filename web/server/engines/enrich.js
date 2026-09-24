@@ -16,9 +16,9 @@
 import { randomUUID } from 'node:crypto';
 import { chromium } from 'playwright';
 
-import { fetchUnblocked, activeProvider } from '../unblocker.js';
+import { fetchUnblocked, activeProvider, isFatalProviderError } from '../unblocker.js';
 import { parseProfile } from '../profile-parser.js';
-import { reconcile, isAlreadyPresent, tagSourceUrls } from '../reconcile.js';
+import { reconcile, findExisting, tagSourceUrls } from '../reconcile.js';
 import { ingestRows, ingestEnabled } from '../ingest.js';
 
 const FLUSH_AT = 100; // send new agents to the ingest webhook in batches of this
@@ -93,10 +93,13 @@ async function run(job, items) {
     if (job.writeMode === 'dry' && !job.message) {
         job.message = 'Dry run — new agents are parsed but NOT written (INGEST_TOKEN not set).';
     }
-    // Surface already-in-DB rows in the results table (skipped, untouched).
+    // Surface already-in-DB rows in the results table (skipped, untouched). The
+    // match travels with the row so the UI can name the identifier and the agent
+    // it hit — an unexplained "already in the database" is impossible to trust.
     for (const it of rec.skipped) {
         job.rows.push({
             url: it.url, source: it.source, status: 'skipped',
+            match: it._match || null,
             row: { Name: it.name, Email: it.email, Phone: it.phone },
         });
     }
@@ -118,7 +121,7 @@ async function run(job, items) {
     let idx = 0;
     const worker = async () => {
         while (idx < queue.length) {
-            if (job.aborted) return;
+            if (job.aborted || job.fatal) return;
             const item = queue[idx]; idx += 1;
             await processOne(job, item, browser);
             job.done += 1;
@@ -127,18 +130,37 @@ async function run(job, items) {
     try {
         await Promise.all(Array.from({ length: job.concurrency }, worker));
     } finally {
+        // Whatever ended the run, rows already scraped are still written.
         await flushAll(job).catch((err) => { job.message = `Final ingest failed: ${err.message}`; });
         await browser.close().catch(() => {});
-        job.status = job.aborted ? 'stopped' : 'done';
+        if (job.fatal) job.status = 'error';
+        else job.status = job.aborted ? 'stopped' : 'done';
     }
+}
+
+// The unblocker account is unusable (expired token, no balance) — every
+// remaining URL would fail identically, so stop the run here and say what to fix
+// instead of grinding through the sheet producing nothing but errors.
+function failRun(job, err) {
+    if (job.fatal) return;
+    job.fatal = true;
+    const who = activeProvider() === 'zenrows' ? 'ZENROWS_API_KEY' : 'BRIGHTDATA_API_TOKEN';
+    job.message = `Unblocker rejected the request: ${err.message}. Every remaining URL would fail `
+        + `the same way, so the run stopped here. Update ${who} and start the import again.`;
 }
 
 // A CAPTCHA page, a blocked stub ("page too small"), or a transient fetch error
 // are all one-off unblocker misses — a fresh attempt usually returns the real
 // page. So fetch+parse retries up to ATTEMPTS before recording a failure, and
 // the whole item runs under a hard watchdog so no single URL can hang the run.
-const ATTEMPTS = 3;
-const ITEM_TIMEOUT_MS = 6 * 60 * 1000;
+// Backoff is exponential + jittered: an anti-bot wall that just served a
+// challenge serves another one straight back, and four attempts 3s apart all
+// land inside the same block window. The retry budget is capped in time as well
+// as in attempts so the last try still finishes inside the watchdog.
+const ATTEMPTS = 4;
+const ITEM_TIMEOUT_MS = 8 * 60 * 1000;
+const RETRY_BUDGET_MS = ITEM_TIMEOUT_MS - 90 * 1000;
+const backoffMs = (attempt) => Math.round((4000 * 2 ** (attempt - 1)) * (0.75 + Math.random() * 0.5));
 
 async function processOne(job, item, browser) {
     let timer;
@@ -160,16 +182,28 @@ async function processOne(job, item, browser) {
 
 async function processOneInner(job, item, browser) {
     const { url, source } = item;
+    const until = Date.now() + RETRY_BUDGET_MS;
     let html = null;
     let parsed = null;
     let lastFail = '';
+    let tries = 0;
     for (let attempt = 1; attempt <= ATTEMPTS; attempt += 1) {
-        if (job.aborted) return {};
-        if (attempt > 1) await new Promise((res) => setTimeout(res, 3000 * (attempt - 1)));
+        if (job.aborted || job.fatal) return {};
+        if (attempt > 1) {
+            if (Date.now() > until) break;          // no time left for another round
+            await new Promise((res) => setTimeout(res, backoffMs(attempt - 1)));
+        }
+        tries = attempt;
         try {
             // Zillow profiles are JS-rendered; realtor server-renders __NEXT_DATA__.
             html = await fetchUnblocked(url, { render: source === 'zillow' });
         } catch (err) {
+            if (isFatalProviderError(err)) {         // the account, not this URL
+                failRun(job, err);
+                job.counts.error += 1;
+                job.rows.push({ url, source, status: 'error', message: err.message });
+                return {};
+            }
             lastFail = err.message;
             continue;
         }
@@ -190,7 +224,7 @@ async function processOneInner(job, item, browser) {
     if (!parsed) {
         const blocked = /page too small|CAPTCHA/i.test(lastFail);
         job.counts[blocked ? 'blocked' : 'error'] += 1;
-        job.rows.push({ url, source, status: blocked ? 'blocked' : 'error', message: `${lastFail} — after ${ATTEMPTS} attempts` });
+        job.rows.push({ url, source, status: blocked ? 'blocked' : 'error', message: `${lastFail} — after ${tries} attempt${tries === 1 ? '' : 's'}` });
         return {};
     }
 
@@ -204,12 +238,12 @@ async function processOneInner(job, item, browser) {
     // Stage-2 cross-check: the scrape may reveal an email/phone the pre-filter
     // couldn't see. If it's already in the DB, skip — never modify an existing
     // agent. Otherwise queue this NEW agent for the ingest webhook.
-    let present = false;
-    try { present = await isAlreadyPresent(parsed.row); } catch { /* treat as new */ }
+    let present = null;
+    try { present = await findExisting(parsed.row); } catch { /* treat as new */ }
     if (item._timedOut) return {};    // watchdog fired during the DB check
     if (present) {
         job.counts.skipped += 1;
-        job.rows.push({ url, source: parsed.source, status: 'skipped', row: parsed.row });
+        job.rows.push({ url, source: parsed.source, status: 'skipped', match: present, row: parsed.row });
         // Same fill-only source_url stamp for a stage-2 skip (matched via the
         // scraped email/phone): the scraped row is already in native shape.
         if (ingestEnabled()) tagSourceUrls([parsed.row]).then((n) => { job.tagged += n; }).catch(() => {});

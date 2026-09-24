@@ -35,6 +35,23 @@ function release() {
     drain();
 }
 
+// An expired token / exhausted balance fails EVERY url the same way, so retrying
+// per row just turns a dead run into a slow dead run (an expired Bright Data
+// token once ground a whole sheet through 3 attempts per URL before finishing
+// with nothing but errors). Mark those errors fatal so the caller can stop the
+// run at the first one and say what to fix.
+const FATAL_STATUS = new Set([401, 402, 403]);
+function fatal(message) {
+    const err = new Error(message);
+    err.fatal = true;
+    return err;
+}
+
+/** True when this error means the provider account itself is unusable. */
+export function isFatalProviderError(err) {
+    return Boolean(err && (err.fatal || /token expired|unauthorized|payment required|insufficient balance/i.test(err.message || '')));
+}
+
 /** Fetch a page's HTML through the configured unblocker (globally rate-limited). */
 export async function fetchUnblocked(targetUrl, opts = {}) {
     const provider = activeProvider();
@@ -68,13 +85,16 @@ async function fetchBrightData(url, { timeoutMs = 120000, retries = 2 } = {}) {
             const body = await res.text();
             clearTimeout(timer);
             if (res.ok) return body;
+            if (FATAL_STATUS.has(res.status)) {
+                throw fatal(`BrightData ${res.status}: ${body.slice(0, 140)}`);
+            }
             if (res.status >= 400 && res.status < 500 && res.status !== 429) {
                 throw new Error(`BrightData ${res.status}: ${body.slice(0, 140)}`);
             }
             lastErr = new Error(`BrightData ${res.status}: ${body.slice(0, 140)}`);
         } catch (err) {
             clearTimeout(timer);
-            if (/BrightData 4\d\d/.test(err.message)) throw err;
+            if (err.fatal || /BrightData 4\d\d/.test(err.message)) throw err;
             lastErr = err;
         }
         await sleep(2000 * (i + 1));
@@ -99,13 +119,16 @@ async function fetchZenRows(url, { render = false, country = 'us', timeoutMs = 1
             const body = await res.text();     // timer stays armed through the body read
             clearTimeout(timer);
             if (res.ok) return body;
+            if (FATAL_STATUS.has(res.status)) {
+                throw fatal(`ZenRows ${res.status}: ${body.slice(0, 140)}`);
+            }
             if (res.status >= 400 && res.status < 500 && res.status !== 429) {
                 throw new Error(`ZenRows ${res.status}: ${body.slice(0, 140)}`);
             }
             lastErr = new Error(`ZenRows ${res.status}`);
         } catch (err) {
             clearTimeout(timer);
-            if (/ZenRows 4\d\d/.test(err.message)) throw err;
+            if (err.fatal || /ZenRows 4\d\d/.test(err.message)) throw err;
             lastErr = err;
         }
         await sleep(2000 * (i + 1));

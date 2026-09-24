@@ -577,6 +577,7 @@ let importJob = null;
 let importPollTimer = null;
 let importRunning = false;
 let importRendered = 0;
+let importJobMessage = '';
 
 $('importFile').addEventListener('change', (e) => {
     const file = e.target.files && e.target.files[0];
@@ -649,6 +650,7 @@ function pollImport() {
             for (const row of (d.newRows || [])) addImportRow(row);
             importRendered += (d.newRows || []).length;
             updateImportProgress(d);
+            importJobMessage = d.message || '';
             if (d.status !== 'running') { finishImport(d.status); return; }
             if (importRunning) importPollTimer = setTimeout(pollImport, 1500);
         })
@@ -680,7 +682,15 @@ function importNote(r) {
     if (r.status === 'error') return r.message || 'scrape error';
     if (r.status === 'blocked') return 'blocked — page too small (likely CAPTCHA / anti-bot); retry later';
     if (r.status === 'dead') return 'no agent found on the page';
-    if (r.status === 'skipped') return 'already in the database';
+    if (r.status === 'skipped') {
+        // Name the identifier AND the row it hit. "already in the database" on its
+        // own can't be checked — and an agent who came in from Courted won't show
+        // under the app's Zillow/Realtor tab, which reads as a false positive.
+        const m = r.match;
+        if (!m) return 'already in the database';
+        const who = [m.name, (m.sources || []).join('/')].filter(Boolean).join(' · ');
+        return `already in the database — matched ${m.by}${who ? ` → ${who}` : ''}`;
+    }
     return r.message || '';
 }
 
@@ -740,7 +750,9 @@ function finishImport(status) {
     $('importStartBtn').disabled = false;
     $('importResolveBtn').disabled = false;
     setStatus('import', status === 'error' ? 'error' : 'done', null);
-    if (status === 'error') setImportMsg('Enrichment stopped with an error — partial results are shown above.', true);
+    // The job's own message names the cause (e.g. an expired unblocker token) —
+    // show it instead of a generic failure line.
+    if (status === 'error') setImportMsg(importJobMessage || 'Enrichment stopped with an error — partial results are shown above.', true);
     else if (status === 'stopped') setImportMsg('Stopped. Everything processed so far is shown above.');
     else setImportMsg('Enrichment complete. ' + $('importStats').textContent.replace(/\s+/g, ' ').trim());
 }

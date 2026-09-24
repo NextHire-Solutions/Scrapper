@@ -18,10 +18,23 @@
 // Skip an agent only on a STRONG identifier hit:
 //   • email  → preferred_email OR enriched_email (normalized, case-insensitive)
 //   • phone  → preferred_phone (last-10 digits; DB stores +1E.164)
-// The dataset has no license column, so license/name aren't used to skip here
-// (a wrong fuzzy match would wrongly drop a real new agent). Name is available
-// for later review only. Chunked in.() queries scale with the dataset size, not
-// the 773k-row table.
+// The dataset has no license column, so license isn't used to skip here. Name is
+// NOT a match key either — but it IS a veto (see below). Chunked in.() queries
+// scale with the dataset size, not the 1.1M-row table.
+//
+// ── Why a name veto (the "already in the database" false positives) ────────────
+// An identifier is only as strong as it is personal. ~0.34% of the phones in
+// `agents` are shared by two or more DIFFERENT agents — office and team lines
+// (one 615 number carries 11 distinct names). A dataset row whose phone is the
+// brokerage's main line would match a stranger's row and be dropped as "already
+// in the database", losing a genuinely new agent. Office emails (info@…) do the
+// same, just more rarely. So a hit is confirmed against the matched row's name:
+//   • unique email hit                  → skip (a personal email is conclusive)
+//   • shared identifier (>1 DB name)    → skip ONLY if the names agree
+//   • phone-only hit, name unknown      → skip only when that phone is unique
+//   • names positively disagree         → NOT a match; scrape it
+// Every skip records WHICH identifier matched and WHOSE row it hit, so the UI can
+// say "matched email · Tanya Spotts (courted)" instead of an unverifiable note.
 //
 // ── Write path (chosen: the existing ingest webhook) ───────────────────────────
 // New agents are written by the engine via ingest.js (the app's proven
@@ -60,6 +73,75 @@ export function validPhone10(d) {
 }
 export function validEmail(e) {
     return /^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(String(e || '').trim());
+}
+
+// ── Name comparison (a veto on weak identifier hits, never a match key) ────────
+// Names are compared loosely on purpose: the dataset and the DB spell the same
+// person differently ("M. Denise Watts" / "Denise Watts", "Bob" / "Robert").
+// Only a clear LAST-name conflict counts as a disagreement.
+export function normName(v) {
+    return String(v || '')
+        .toLowerCase()
+        .replace(/[.,]/g, ' ')
+        .replace(/\b(jr|sr|ii|iii|iv|md|phd|realtor|abr|crs|gri|pa|llc|inc)\b/g, ' ')
+        .replace(/[^a-z\s'-]/g, ' ')
+        .replace(/\s+/g, ' ')
+        .trim();
+}
+function lastName(v) {
+    const parts = normName(v).split(' ').filter((p) => p.length > 1);
+    return parts.length ? parts[parts.length - 1] : '';
+}
+
+/**
+ * Do these two names plausibly belong to the same person?
+ * @returns {boolean|null} true = agree, false = conflict, null = can't tell
+ *   (either side blank / single-token), which callers treat as "not a veto".
+ */
+export function nameAgrees(a, b) {
+    const na = normName(a);
+    const nb = normName(b);
+    if (!na || !nb) return null;
+    if (na === nb) return true;
+    const la = lastName(a);
+    const lb = lastName(b);
+    if (!la || !lb) return null;
+    if (la === lb) return true;
+    // One name contained in the other ("denise watts" ⊂ "m denise watts").
+    if (na.includes(nb) || nb.includes(na)) return true;
+    return false;
+}
+
+/** nameAgrees() against a set of candidate names: agreement with ANY wins. */
+function nameAgreesAny(name, names) {
+    let verdict = null;
+    for (const n of names) {
+        const v = nameAgrees(name, n);
+        if (v === true) return true;
+        if (v === false) verdict = false;
+    }
+    return verdict;
+}
+
+/**
+ * Stricter test, used to CONFIRM a match on a shared identifier (an office line
+ * that several agents answer). There, surnames alone prove nothing — a desk with
+ * "Emily Williams" and "Clayton Williams" on it would otherwise swallow whichever
+ * one is genuinely new. Requires the surname AND a compatible first name (equal,
+ * an initial, or a prefix: "Kate"/"Katherine").
+ * Being strict here is the cheap direction: a row we wrongly treat as new is
+ * re-merged by the ingest webhook's own license→email→phone dedup, whereas a row
+ * we wrongly skip is lost from the import entirely.
+ */
+export function nameMatchesStrict(a, b) {
+    if (nameAgrees(a, b) !== true) return false;
+    const fa = normName(a).split(' ')[0] || '';
+    const fb = normName(b).split(' ')[0] || '';
+    if (!fa || !fb) return false;
+    if (fa === fb) return true;
+    const [short, long] = fa.length <= fb.length ? [fa, fb] : [fb, fa];
+    if (short.length === 1) return long.startsWith(short);   // "k moore" / "kate moore"
+    return long.startsWith(short);                           // "kate" / "katherine"
 }
 
 // A license is a usable identifier only if it's a plausible number/alnum code
@@ -126,30 +208,87 @@ function phoneKeys(row) {
     return clauses;
 }
 
+// Record one DB row against an identifier key. Several rows can carry the same
+// key (a shared office line), so each key keeps the set of names behind it —
+// that's what tells a personal identifier from a switchboard.
+function register(hits, key, row) {
+    let hit = hits.get(key);
+    if (!hit) {
+        hit = { rows: [], names: new Set() };
+        hits.set(key, hit);
+    }
+    if (!hit.rows.some((r) => r.id === row.id)) {
+        hit.rows.push({ id: row.id, name: row.full_name || '', sources: row.sources || [] });
+    }
+    if (row.full_name) hit.names.add(row.full_name);
+    return hit;
+}
+
+// Which of the rows behind an identifier does this skip actually refer to? On a
+// shared line that's the one whose name agrees — reporting the first row instead
+// would name a stranger and make the skip look like the bug it isn't.
+function bestRow(name, hit) {
+    return hit.rows.find((r) => nameMatchesStrict(name, r.name))
+        || hit.rows.find((r) => nameAgrees(name, r.name) === true)
+        || hit.rows[0];
+}
+
 /**
  * Look up which of these normalized rows already exist in `agents`.
- * @returns {Promise<Set<string>>} set of matched email/phone keys ("e:<email>" / "p:<10digits>")
+ * @returns {Promise<Map<string,{id,name,sources,names:Set<string>}>>} keyed by
+ *   "e:<email>" / "p:<10digits>" — the matched row(s) behind each identifier.
  */
 async function loadMatches(list) {
     const emails = [...new Set(list.map((x) => x._email).filter(Boolean))];
     const phones = [...new Set(list.map((x) => x._phoneE164).filter(Boolean))];
-    const hits = new Set();
+    const hits = new Map();
+    const SELECT = 'id,full_name,sources';
 
     for (const grp of chunk(emails, CHUNK)) {
         const inList = grp.map(enc).join(',');
         const rows = await sbGet(
-            `agents?or=(preferred_email.in.(${inList}),enriched_email.in.(${inList}))&select=preferred_email,enriched_email`,
+            `agents?or=(preferred_email.in.(${inList}),enriched_email.in.(${inList}))&select=${SELECT},preferred_email,enriched_email`,
         );
         for (const r of rows) {
-            if (r.preferred_email) hits.add(`e:${normEmail(r.preferred_email)}`);
-            if (r.enriched_email) hits.add(`e:${normEmail(r.enriched_email)}`);
+            if (r.preferred_email) register(hits, `e:${normEmail(r.preferred_email)}`, r);
+            if (r.enriched_email) register(hits, `e:${normEmail(r.enriched_email)}`, r);
         }
     }
     for (const grp of chunk(phones, CHUNK)) {
-        const rows = await sbGet(`agents?preferred_phone=in.(${grp.map(enc).join(',')})&select=preferred_phone`);
-        for (const r of rows) hits.add(`p:${normPhone(r.preferred_phone)}`);
+        const rows = await sbGet(`agents?preferred_phone=in.(${grp.map(enc).join(',')})&select=${SELECT},preferred_phone`);
+        for (const r of rows) register(hits, `p:${normPhone(r.preferred_phone)}`, r);
+    }
+    // Also match the app's own `phone:<10 digits>` dedup key. The 1.1M rows do NOT
+    // all store E.164 — a Realtor-sourced row keeps the display format
+    // "(202) 253-1251", which the preferred_phone.in.() query above can't see. The
+    // match_key is format-independent, so this catches the rows that would
+    // otherwise be re-scraped and MERGED into (the additive-only rule's failure
+    // mode), not just skipped.
+    for (const grp of chunk(phones.map((p) => `phone:${normPhone(p)}`), CHUNK)) {
+        const rows = await sbGet(`agents?match_key=in.(${grp.map(enc).join(',')})&select=${SELECT},match_key`);
+        for (const r of rows) register(hits, `p:${String(r.match_key).slice(6)}`, r);
     }
     return hits;
+}
+
+/**
+ * Confirm (or veto) an identifier hit against the matched row's name.
+ * @param {string} name the dataset row's name ('' when the input is a bare URL)
+ * @param {'email'|'phone'} by which identifier hit
+ * @param {{names:Set<string>}} hit the DB row(s) behind that identifier
+ * @returns {boolean} true = genuinely already in the DB
+ */
+function confirmHit(name, by, hit) {
+    const unique = hit.names.size <= 1;
+    if (by === 'email' && unique) return true;      // a personal email is conclusive
+    if (!unique) {
+        // Shared identifier — only a strict name match proves it's the same person.
+        return [...hit.names].some((n) => nameMatchesStrict(name, n));
+    }
+    const agree = nameAgreesAny(name, hit.names);
+    if (agree === true) return true;
+    if (agree === false) return false;              // different person, same number
+    return true;                                    // no name to judge by — trust a unique hit
 }
 
 /**
@@ -188,8 +327,22 @@ export async function reconcile(items) {
     const toScrape = [];
     const skipped = [];
     for (const it of list) {
-        const present = (it._email && hits.has(`e:${it._email}`)) || (it._phone && hits.has(`p:${it._phone}`));
-        (present ? skipped : toScrape).push(it);
+        // Email first (the stronger identifier), then phone. The first hit the
+        // name confirms wins and is recorded on the row for the UI.
+        const candidates = [
+            it._email ? ['email', hits.get(`e:${it._email}`)] : null,
+            it._phone ? ['phone', hits.get(`p:${it._phone}`)] : null,
+        ].filter((c) => c && c[1]);
+        let match = null;
+        for (const [by, hit] of candidates) {
+            if (confirmHit(it.name, by, hit)) {
+                const r = bestRow(it.name, hit);
+                match = { by, id: r.id, name: r.name, sources: r.sources, shared: hit.names.size > 1 };
+                break;
+            }
+        }
+        if (match) skipped.push({ ...it, _match: match });
+        else toScrape.push(it);
     }
     return { toScrape, skipped, counts: { present: skipped.length, absent: toScrape.length }, db: true };
 }
@@ -205,24 +358,71 @@ export async function reconcile(items) {
  * into that existing row — skipping is both correct AND protects the existing row.
  * (Realtor rows carry a license but usually no email, and their phone is stored
  * in display format, so email/phone alone would miss a re-import.)
+ * A phone-only hit is confirmed against the scraped NAME for the same reason the
+ * pre-filter does it — the number may be the office's, not the agent's.
  * @param {object} row a scraped native Zillow/Realtor row
- * @returns {Promise<boolean>} true if this agent already exists in the DB
+ * @returns {Promise<{by:string,id:string,name:string,sources:string[]}|null>}
+ *   the matched existing row, or null if this agent is genuinely new
  */
-export async function isAlreadyPresent(row) {
-    if (!dbEnabled() || !row) return false;
+export async function findExisting(row) {
+    if (!dbEnabled() || !row) return null;
     const email = validEmail(row.Email) ? normEmail(row.Email) : '';
     const lic = licenseKey(row['License Number']);
+    const phones = new Set();
+    for (const raw of [row.Phone, row['Mobile Phone']]) {
+        const d = normPhone(raw);
+        if (validPhone10(d)) phones.add(d);
+    }
     const ors = [];
     if (email) ors.push(`preferred_email.eq.${enc(email)}`, `enriched_email.eq.${enc(email)}`);
     if (lic) ors.push(`license_number.eq.${enc(lic)}`);
     ors.push(...phoneKeys(row));
-    if (!ors.length) return false;
+    if (!ors.length) return null;
+
+    let rows;
     try {
-        const rows = await sbGet(`agents?or=(${ors.join(',')})&select=id&limit=1`);
-        return rows.length > 0;
+        rows = await sbGet(
+            // The limit has to clear the biggest shared line in the table — one 615
+            // number is on 580 rows — or the candidates truncate away the row whose
+            // name agrees and a returning agent gets re-scraped as new.
+            `agents?or=(${ors.join(',')})&select=id,full_name,sources,license_number,preferred_email,enriched_email,preferred_phone,match_key&limit=1000`,
+        );
     } catch {
-        return false;
+        return null;                   // a DB hiccup must never drop a real agent
     }
+    if (!rows.length) return null;
+
+    const name = row.Name;
+    const phoneOnly = [];
+    for (const r of rows) {
+        // License is the DB app's own dedup key — an exact hit means re-sending
+        // this agent would MERGE into that row, so it's conclusive.
+        if (lic && normLicense(r.license_number) === normLicense(lic)) {
+            return { by: 'license', id: r.id, name: r.full_name || '', sources: r.sources || [] };
+        }
+        if (email && (normEmail(r.preferred_email) === email || normEmail(r.enriched_email) === email)) {
+            return { by: 'email', id: r.id, name: r.full_name || '', sources: r.sources || [] };
+        }
+        const mk = String(r.match_key || '');
+        if (phones.has(normPhone(r.preferred_phone)) || (mk.startsWith('phone:') && phones.has(mk.slice(6)))) {
+            phoneOnly.push(r);
+        }
+    }
+    if (!phoneOnly.length) return null;
+    // Phone-only: same rule as the pre-filter — a shared line needs the names to
+    // agree, a unique one is trusted unless the names positively conflict.
+    const hit = {
+        names: new Set(phoneOnly.map((r) => r.full_name).filter(Boolean)),
+        rows: phoneOnly.map((r) => ({ id: r.id, name: r.full_name || '', sources: r.sources || [] })),
+    };
+    if (!confirmHit(name, 'phone', hit)) return null;
+    const best = bestRow(name, hit);
+    return { by: 'phone', id: best.id, name: best.name, sources: best.sources };
+}
+
+/** Back-compat boolean wrapper around findExisting(). */
+export async function isAlreadyPresent(row) {
+    return Boolean(await findExisting(row));
 }
 
 /**
